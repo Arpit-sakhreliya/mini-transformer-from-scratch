@@ -744,3 +744,470 @@ print("".join(result))
 | Dropout | Regularization during training | Zero random elements of attention weights or MLP hidden layer |
 
 
+# Mini Transformer: End-to-End Walkthrough
+
+A single forward pass, loss computation, and backward pass — traced with exact matrix shapes and concrete numbers for the input `["I", " ", "like"]` predicting `" "`.
+
+---
+
+## The Setup
+
+```
+vocab_size  = 10    embedding_dim d = 8    MLP hidden = 16    blocks = 2
+```
+
+**Vocabulary:**
+```
+"I"→0  " "→4  "like"→1  "cats"→2  "dogs"→3
+"you"→5  "hate"→6  "birds"→7  "."→8  "<END>"→9
+```
+
+**Input sequence:** `["I", " ", "like"]`  → token IDs `[0, 4, 1]`  
+**Target token:** `" "` → ID `4`
+
+---
+
+## FORWARD PASS
+
+---
+
+### Step 1 — Token Embedding
+
+`embedding_matrix E` has shape **(10 × 8)** — one 8-dimensional row per vocabulary token.
+
+Look up the three input IDs:
+
+```
+X = E[[0, 4, 1]]   →   shape: (3, 8)
+
+X = [ E[0],    ← row for "I"
+      E[4],    ← row for " "
+      E[1] ]   ← row for "like"
+```
+
+Each row is a learned 8-dimensional vector. Row order encodes position.
+
+---
+
+### Step 2 — Transformer Block 1: Self-Attention
+
+**Weights:** `WQ1, WK1, WV1, WO1` each shape **(8 × 8)**
+
+**Project X into Q, K, V:**
+
+```
+Q = X @ WQ1    →   shape: (3, 8)      "what am I looking for?"
+K = X @ WK1    →   shape: (3, 8)      "what do I contain?"
+V = X @ WV1    →   shape: (3, 8)      "what do I send if attended to?"
+```
+
+**Compute attention scores** — how much should each token attend to every other?
+
+```
+scores = (Q @ Kᵀ) / √8    →   shape: (3, 3)
+
+         "I"    " "   "like"
+"I"   [ s₀₀   s₀₁   s₀₂ ]
+" "   [ s₁₀   s₁₁   s₁₂ ]
+"like"[ s₂₀   s₂₁   s₂₂ ]
+```
+
+Dividing by `√8 ≈ 2.83` prevents dot products from growing too large, which would saturate softmax.
+
+**Convert scores to attention weights** (softmax row-wise):
+
+```
+weights = softmax(scores, axis=1)    →   shape: (3, 3)
+
+weights[i, j] = probability that token i attends to token j
+Each row sums to 1.
+```
+
+Example — if "like" (row 2) has learned to focus on " " (position 1):
+```
+weights[2] ≈ [0.05, 0.90, 0.05]
+```
+
+**Weighted sum of values:**
+
+```
+context = weights @ V         →   shape: (3, 8)
+```
+
+Each token's new representation is a mixture of all value vectors, weighted by attention.
+
+**Output projection:**
+
+```
+A1 = context @ WO1            →   shape: (3, 8)
+```
+
+---
+
+### Step 3 — Layer Norm (after Attention)
+
+Normalize every element in A1 to stabilize scale:
+
+```
+μ = mean(A1)
+σ = std(A1)
+A1_ln = (A1 - μ) / (σ + 1e-5)    →   shape: (3, 8)
+```
+
+---
+
+### Step 4 — Transformer Block 1: MLP
+
+**Weights:** `W1_1` shape **(8 × 16)**, `W2_1` shape **(16 × 8)**
+
+```
+hidden_pre = A1_ln @ W1_1        →   shape: (3, 16)    [expand]
+hidden     = ReLU(hidden_pre)    →   shape: (3, 16)    [gate negatives to 0]
+H1         = hidden @ W2_1       →   shape: (3, 8)     [compress back]
+```
+
+**ReLU:** `max(0, x)` — keeps positive activations, zeros out negatives. Without it, two matrix multiplications collapse into one linear transformation.
+
+---
+
+### Step 5 — Layer Norm (after MLP)
+
+```
+H1_ln = layernorm(H1)    →   shape: (3, 8)
+```
+
+---
+
+### Step 6 — Transformer Block 2
+
+Identical structure to Block 1, with **its own independent weights** `WQ2, WK2, WV2, WO2, W1_2, W2_2`.
+
+Input is `H1_ln`. Output is `H2_ln`, shape **(3, 8)**.
+
+Block 1 learns low-level co-occurrence patterns. Block 2 builds higher-level structure on top.
+
+---
+
+### Step 7 — Output Projection
+
+**Weight:** `W_out` shape **(8 × 10)**
+
+```
+logits = H2_ln @ W_out    →   shape: (3, 10)
+```
+
+Each row is a score over all 10 vocabulary tokens. We only care about the **last row** — the prediction for what comes after `"like"`:
+
+```
+last_logits = logits[-1]    →   shape: (10,)
+
+[ score_"I", score_" ", score_"like", score_"cats", score_"dogs",
+  score_"you", score_"hate", score_"birds", score_".", score_"<END>" ]
+```
+
+---
+
+### Step 8 — Softmax → Probabilities
+
+```
+probs = softmax(last_logits)    →   shape: (10,)
+
+probs[i] = exp(last_logits[i]) / Σⱼ exp(last_logits[j])
+```
+
+All values positive, sum to 1. Example at an untrained model:
+
+```
+probs ≈ [0.08, 0.12, 0.09, 0.11, 0.10, 0.09, 0.11, 0.10, 0.10, 0.10]
+          "I"   " "  "like" "cats" "dogs" "you" "hate" "birds" "." "<END>"
+```
+
+The model predicts `" "` with probability 0.12 — barely better than random.
+
+---
+
+## LOSS COMPUTATION
+
+---
+
+### Cross-Entropy Loss
+
+Target is `" "` → ID `4`.
+
+```
+L = -log(probs[4])
+  = -log(0.12)
+  ≈ 2.12
+```
+
+**Interpretation:**
+| Loss | Meaning |
+|------|---------|
+| 0.0 | Perfect — `probs[4] = 1.0` |
+| 2.30 | Random — `probs[4] = 0.10` (uniform over 10 tokens) |
+| >4.0 | Confidently wrong |
+
+At the start of training, loss ≈ 2.3 (random). After 400 epochs on this tiny dataset it converges toward 0.
+
+---
+
+## BACKWARD PASS
+
+The chain rule propagates `dL/dW` from the output back through every layer. Each gradient tells each weight: *"move this much in this direction to reduce loss."*
+
+---
+
+### Step B1 — Gradient of Loss w.r.t. Logits
+
+The softmax + cross-entropy gradient has a clean closed form:
+
+```
+∂L/∂last_logits[i] = probs[i] - 1{i == 4}
+```
+
+In practice: subtract 1 from the correct class slot, leave others unchanged.
+
+```
+grad_logits = [0.08,  0.12,  0.09,  0.11,  0.10, ...]
+                                            ↑
+                                subtract 1 here (target = 4)
+            = [0.08,  0.12,  0.09,  0.11, -0.90, ...]
+```
+
+Large negative on the correct class: the model needs to push its score up hard. Small positives elsewhere: those need to come down slightly.
+
+---
+
+### Step B2 — Gradient through W_out
+
+```
+logits[-1] = H2_ln[-1] @ W_out
+```
+
+```
+∂L/∂W_out    = H2_ln[-1]ᵀ ⊗ grad_logits    →   shape: (8, 10)
+∂L/∂H2_ln    = zeros(3, 8),  except last row = grad_logits @ W_outᵀ
+               →   shape: (3, 8)
+```
+
+Only the last token row contributes to the loss — the gradient is zero for positions 0 and 1.
+
+---
+
+### Step B3 — Gradient through Layer Norm
+
+For `H2_ln = layernorm(H2)`:
+
+```
+∂L/∂H2 = (1/σ) · ( ∂L/∂H2_ln  −  mean(∂L/∂H2_ln)  −  H2_ln · mean(∂L/∂H2_ln · H2_ln) )
+```
+
+This accounts for the coupling introduced by mean-subtraction and std-division across the matrix.
+
+```
+→   shape: (3, 8)
+```
+
+---
+
+### Step B4 — Gradient through MLP Block 2
+
+Working backwards through `H2 = hidden @ W2_2`:
+
+```
+∂L/∂W2_2  = hiddenᵀ @ ∂L/∂H2          →   shape: (16, 8)
+∂L/∂hidden = ∂L/∂H2 @ W2_2ᵀ           →   shape: (3, 16)
+```
+
+Through ReLU — the gate: gradient only passes where the pre-activation was positive:
+
+```
+∂L/∂hidden_pre[i,j] = ∂L/∂hidden[i,j]   if hidden_pre[i,j] > 0
+                     = 0                  otherwise
+```
+
+Through `hidden_pre = A2_ln @ W1_2`:
+
+```
+∂L/∂W1_2  = A2_lnᵀ @ ∂L/∂hidden_pre    →   shape: (8, 16)
+∂L/∂A2_ln = ∂L/∂hidden_pre @ W1_2ᵀ     →   shape: (3, 8)
+```
+
+---
+
+### Step B5 — Gradient through Attention Block 2
+
+Given upstream gradient `∂L/∂A2`:
+
+```
+1. WO:   ∂L/∂WO2          = context_preᵀ @ ∂L/∂A2       →  shape: (8, 8)
+         ∂L/∂context_pre  = ∂L/∂A2 @ WO2ᵀ               →  shape: (3, 8)
+
+2. V:    ∂L/∂V            = weightsᵀ @ ∂L/∂context_pre  →  shape: (3, 8)
+         ∂L/∂weights      = ∂L/∂context_pre @ Vᵀ         →  shape: (3, 3)
+
+3. Softmax (per row i):
+         ∂L/∂scores[i] = weights[i] ⊙ ( ∂L/∂weights[i] − weights[i]·∂L/∂weights[i] )
+
+4. Q, K: ∂L/∂Q  = ∂L/∂scores @ K / √8                   →  shape: (3, 8)
+         ∂L/∂K  = ∂L/∂scoresᵀ @ Q / √8                  →  shape: (3, 8)
+
+5. WQ, WK, WV:
+         ∂L/∂WQ2 = H1_lnᵀ @ ∂L/∂Q                       →  shape: (8, 8)
+         ∂L/∂WK2 = H1_lnᵀ @ ∂L/∂K                       →  shape: (8, 8)
+         ∂L/∂WV2 = H1_lnᵀ @ ∂L/∂V                       →  shape: (8, 8)
+
+6. Back to H1_ln:
+         ∂L/∂H1_ln = ∂L/∂Q @ WQ2ᵀ + ∂L/∂K @ WK2ᵀ + ∂L/∂V @ WV2ᵀ
+                   →  shape: (3, 8)
+```
+
+---
+
+### Step B6 — Block 1 (same pattern, own weights)
+
+Gradient flows through:
+
+```
+layernorm(H1)  →  mlp_backward(W1_1, W2_1)  →  layernorm(A1)  →  attention_backward(WQ1, WK1, WV1, WO1)
+```
+
+This produces `∂L/∂X` of shape **(3, 8)** — the gradient w.r.t. the input embeddings.
+
+---
+
+### Step B7 — Gradient through Embeddings
+
+For each token in the input sequence, update its embedding row:
+
+```
+embedding_matrix[vocab["I"]]    -= lr · ∂L/∂X[0]
+embedding_matrix[vocab[" "]]    -= lr · ∂L/∂X[1]
+embedding_matrix[vocab["like"]] -= lr · ∂L/∂X[2]
+```
+
+The embedding for `"like"` gets nudged in the direction that makes it easier for the attention layers downstream to predict `" "` after it.
+
+---
+
+## WEIGHT UPDATE
+
+After backprop computes gradients for all 13 weight matrices, SGD applies:
+
+```
+W ← W − lr · ∂L/∂W       (lr = 0.01)
+```
+
+Applied to every matrix:
+
+```
+W_out  (8×10)     W1_1, W2_1  (8×16, 16×8)     W1_2, W2_2  (8×16, 16×8)
+WQ1, WK1, WV1, WO1  (8×8 each)
+WQ2, WK2, WV2, WO2  (8×8 each)
+embedding_matrix    (10×8)
+```
+
+**Total parameters updated per step: 1,184**
+
+---
+
+## COMPLETE DATA FLOW SUMMARY
+
+```
+Input: ["I", " ", "like"]   Target: " " (ID 4)
+
+FORWARD
+──────────────────────────────────────────────────────────────────────
+token IDs  [0, 4, 1]
+    │  E (10×8)
+    ▼
+X          (3, 8)   ← 3 token embeddings
+    │  WQ1,WK1,WV1,WO1 (8×8 each)
+    ▼
+A1         (3, 8)   ← after attention block 1
+    ▼  layernorm
+A1_ln      (3, 8)
+    │  W1_1 (8×16), W2_1 (16×8)
+    ▼
+H1         (3, 8)   ← after MLP block 1
+    ▼  layernorm
+H1_ln      (3, 8)
+    │  WQ2,WK2,WV2,WO2 (8×8 each)
+    ▼
+A2         (3, 8)   ← after attention block 2
+    ▼  layernorm
+A2_ln      (3, 8)
+    │  W1_2 (8×16), W2_2 (16×8)
+    ▼
+H2         (3, 8)   ← after MLP block 2
+    ▼  layernorm
+H2_ln      (3, 8)
+    │  W_out (8×10)
+    ▼
+logits     (3, 10)
+    ▼  logits[-1]
+last_logits (10,)
+    ▼  softmax
+probs       (10,)   →   L = -log(probs[4])   ≈ 2.12
+
+BACKWARD
+──────────────────────────────────────────────────────────────────────
+grad_logits  (10,)   = probs − one_hot(4)
+    │  W_out
+    ▼
+∂L/∂H2_ln  (3, 8)   ← last row only
+    │  layernorm
+    ▼
+∂L/∂H2     (3, 8)
+    │  W1_2, W2_2, ReLU
+    ▼
+∂L/∂A2_ln  (3, 8)   →   grads: ∂W1_2, ∂W2_2
+    │  layernorm
+    ▼
+∂L/∂A2     (3, 8)
+    │  WQ2,WK2,WV2,WO2, softmax
+    ▼
+∂L/∂H1_ln  (3, 8)   →   grads: ∂WQ2, ∂WK2, ∂WV2, ∂WO2
+    │  layernorm
+    ▼
+∂L/∂H1     (3, 8)
+    │  W1_1, W2_1, ReLU
+    ▼
+∂L/∂A1_ln  (3, 8)   →   grads: ∂W1_1, ∂W2_1
+    │  layernorm
+    ▼
+∂L/∂A1     (3, 8)
+    │  WQ1,WK1,WV1,WO1, softmax
+    ▼
+∂L/∂X      (3, 8)   →   grads: ∂WQ1, ∂WK1, ∂WV1, ∂WO1
+    │  embedding lookup
+    ▼
+embedding_matrix rows [0, 4, 1] updated in-place
+
+UPDATE:   W ← W − 0.01 · ∂L/∂W   for all 13 matrices + embeddings
+```
+
+---
+
+## WHY 400 EPOCHS?
+
+One update on one training pair nudges 1,184 parameters by a tiny amount. The dataset has 5 sentences × ~7 pairs each = **35 training pairs per epoch**. The model must learn:
+
+- Sentences starting with `"I"` are followed by `" "` then `"like"` or `"hate"`
+- `"like"/"hate"` are always followed by an animal word
+- `"birds"` only follows `"hate"` — never `"like"`
+
+Each of these patterns lives across multiple weight matrices. It takes hundreds of passes before the gradients consistently reinforce the same directions across all 1,184 parameters simultaneously.
+
+---
+
+## WHAT EACH LAYER IS ACTUALLY LEARNING
+
+| Layer | What gradient adjusts it toward |
+|-------|----------------------------------|
+| Embeddings | `"like"` and `"hate"` land in similar regions (both precede animals); `"cats"` and `"dogs"` cluster together |
+| WQ1, WK1 | Which token pairs to match up — e.g. verbs should query their subject |
+| WV1, WO1 | What information to extract and forward when a match is found |
+| W1_1, W2_1 | Pattern detectors: one hidden unit might activate for "verb following subject" |
+| Block 2 weights | Higher-order patterns built on Block 1's abstractions |
+| W_out | Maps the final 8-dim representation to a score over the 10 output tokens |
