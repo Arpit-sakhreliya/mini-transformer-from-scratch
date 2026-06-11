@@ -662,14 +662,37 @@ using only the first token as the prompt, and prints the result vs. the expected
 **Total parameter count:**
 
 ```
-Embeddings:          10 × 8  =   80
-Block 1 attention:   4 × 8×8 =  256
-Block 1 MLP:         8×16 + 16×8 = 256
-Block 2 attention:   4 × 8×8 =  256
-Block 2 MLP:         8×16 + 16×8 = 256
-Output:              8 × 10  =   80
+Embedding:
+(10 × 8) = 80
+
+Block 1 Attention:
+WQ1: (8 × 8) = 64
+WK1: (8 × 8) = 64
+WV1: (8 × 8) = 64
+WO1: (8 × 8) = 64
+Total = 256
+
+Block 1 MLP:
+W1_1: (8 × 16) = 128
+W2_1: (16 × 8) = 128
+Total = 256
+
+Block 2 Attention:
+WQ2: (8 × 8) = 64
+WK2: (8 × 8) = 64
+WV2: (8 × 8) = 64
+WO2: (8 × 8) = 64
+Total = 256
+
+Block 2 MLP:
+W1_2: (8 × 16) = 128
+W2_2: (16 × 8) = 128
+Total = 256
+
+Output Projection:
+W_out: (8 × 10) = 80
 ─────────────────────────────────────
-Total:                          1,184
+Total: 80 + 256 + 256 + 256 + 256 + 80 = 1,184 parameters
 ```
 
 GPT-3 has 175 billion parameters. This model has 1,184.
